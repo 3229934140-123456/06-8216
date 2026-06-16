@@ -72,20 +72,59 @@ class Image:
         img.set_meta("idat_chunks", png.idat_chunk_count)
         img.set_meta("compressed_size", png.compressed_idat_size)
         img.set_meta("raw_size", png.raw_idat_size)
+        img.set_meta("text_chunks", list(png.text_chunks))
+        if png.gama is not None:
+            img.set_meta("gama", png.gama)
+        if png.srgb is not None:
+            img.set_meta("srgb", png.srgb)
+        if png.phys is not None:
+            img.set_meta("phys", png.phys)
+        if png.unknown_chunks:
+            img.set_meta("unknown_chunks", list(png.unknown_chunks))
+        if png.transparency is not None:
+            img.set_meta("source_transparency", png.transparency)
 
         if png.color_type == 3 and png.palette is not None:
-            img.pixels = [[png.palette[png.pixels[y][x]] for x in range(png.width)] for y in range(png.height)]
-            for row in img.pixels:
-                for i in range(len(row)):
-                    p = row[i]
-                    row[i] = (p[0], p[1], p[2], 255)
+            transparency = png.transparency
+            img.pixels = []
+            for y in range(png.height):
+                row = []
+                for x in range(png.width):
+                    idx = png.pixels[y][x]
+                    if 0 <= idx < len(png.palette):
+                        r, g, b = png.palette[idx]
+                    else:
+                        r, g, b = 0, 0, 0
+                    a = 255
+                    if transparency is not None and idx < len(transparency):
+                        a = transparency[idx]
+                    row.append((r, g, b, a))
+                img.pixels.append(row)
         elif png.color_type == 0:
+            chroma_key = png.transparency if (png.color_type == 0 and isinstance(png.transparency, int)) else None
             img.pixels = []
             for y in range(png.height):
                 row = []
                 for x in range(png.width):
                     v = png.pixels[y][x]
-                    row.append((v, v, v, 255))
+                    a = 255
+                    if chroma_key is not None and v == chroma_key:
+                        a = 0
+                    row.append((v, v, v, a))
+                img.pixels.append(row)
+        elif png.color_type == 2 and isinstance(png.transparency, tuple):
+            cr, cg, cb = png.transparency
+            if png.bit_depth != 8:
+                scale = 255.0 / ((1 << png.bit_depth) - 1)
+                cr, cg, cb = int(cr * scale), int(cg * scale), int(cb * scale)
+            img.pixels = []
+            for y in range(png.height):
+                row = []
+                for x in range(png.width):
+                    p = png.pixels[y][x]
+                    r, g, b = p[:3]
+                    a = 0 if (r == cr and g == cg and b == cb) else 255
+                    row.append((r, g, b, a))
                 img.pixels.append(row)
         else:
             img.pixels = []

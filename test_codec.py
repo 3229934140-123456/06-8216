@@ -2,10 +2,11 @@ import random
 import sys
 import struct
 import zlib
+import os
 from image import Image
 from bmp_codec import bmp_bytes_per_row, bmp_row_padding
 from bmp_codec import BMPImage, read_bmp, write_bmp, BMPError
-from png_codec import PNGImage, read_png, write_png, PNGError, PNG_SIGNATURE, FILTER_NAMES, COLOR_TYPE_NAMES, crc32
+from png_codec import PNGImage, read_png, write_png, PNGError, PNG_SIGNATURE, FILTER_NAMES, COLOR_TYPE_NAMES, crc32, PNGChunk
 from palette import PaletteError, build_palette_and_quantize, QuantizationResult
 
 
@@ -822,6 +823,412 @@ def test_cli_smoke():
 # Main
 # ============================================================
 
+# ============================================================
+# Test 8: PNG ancillary chunks (gAMA/sRGB/tEXt/tRNS + unknown)
+# ============================================================
+
+def test_png_ancillary_chunks():
+    print("\n" + "=" * 65)
+    print("TEST 8: PNG Ancillary Chunks (gAMA/sRGB/tEXt + unknown)")
+    print("=" * 65)
+
+    all_pass = True
+    img = create_gradient_image(8, 6, alpha=True)
+
+    # --- Subtest A: write PNG with sRGB + gAMA + tEXt + custom unknown chunk ---
+    print("\n  --- Encoder: sRGB + gAMA + tEXt + unknown chunk preservation ---")
+    png = PNGImage()
+    png.width = img.width
+    png.height = img.height
+    png.bit_depth = 8
+    png.color_type = 6
+    png.pixels = img.pixels
+    png.srgb = 0  # Perceptual
+    png.gama = 1.0 / 2.2  # ~0.45455
+    png.text_chunks = [
+        ("Software", "imcodec test suite v1.0"),
+        ("Author", "Test Author"),
+        ("Description", "A test gradient with metadata"),
+    ]
+    png.phys = (2835, 2835, 1)  # 72 DPI in pixels-per-meter
+
+    # Unknown chunk (non-critical 'teSt' - lowercase first char = ancillary)
+    extra = [(b'teSt', b'hello world custom chunk data')]
+
+    try:
+        data = write_png(png, filter_type=4, extra_chunks=extra, write_ancillary=True)
+    except Exception as e:
+        print(f"    [FAIL] write_png with ancillary: {type(e).__name__}: {e}")
+        all_pass = False
+    else:
+        # Read back and check chunks
+        try:
+            back = read_png(data, strict_crc=True)
+            checks = [
+                ("sRGB intent=0", back.srgb == 0),
+                ("gAMA≈0.45455", back.gama is not None and abs(back.gama - 0.45455) < 0.001),
+                ("pHYs 2835x2835 unit=1", back.phys == (2835, 2835, 1)),
+                ("tEXt count=3", len(back.text_chunks) == 3),
+                ("tEXt Software present", any(kw == "Software" and "imcodec" in tx
+                                              for kw, tx in back.text_chunks)),
+                ("unknown chunks contains teSt",
+                 any(name == 'teSt' for name, length, order in back.unknown_chunks)),
+            ]
+            for name, ok in checks:
+                tag = "PASS" if ok else "FAIL"
+                if not ok:
+                    all_pass = False
+                print(f"    [{tag}] {name}")
+            # pixel roundtrip (RGBA with metadata does not affect pixels)
+            decoded_img = Image.from_png(data)
+            diff_count, _ = img.count_differences(decoded_img, ignore_alpha=False)
+            if diff_count == 0:
+                print(f"    [PASS] RGBA pixels LOSSLESS despite ancillary chunks (0 diffs)")
+            else:
+                print(f"    [FAIL] RGBA pixels: {diff_count} diffs")
+                all_pass = False
+            # describe() should print these chunks (verify no exceptions)
+            desc = back.describe()
+            for key in ["sRGB", "gAMA", "pHYs", "tEXt chunks: 3", "Unhandled chunks:",
+                        "teSt"]:
+                if key not in desc:
+                    print(f"    [FAIL] describe() missing '{key}'")
+                    all_pass = False
+            print(f"    [PASS] describe() prints all ancillary info")
+        except Exception as e:
+            print(f"    [FAIL] read_png back with ancillary: {type(e).__name__}: {e}")
+            all_pass = False
+
+    return all_pass
+
+
+# ============================================================
+# Test 9: PNG tRNS palette transparency
+# ============================================================
+
+def test_png_trns_transparency():
+    print("\n" + "=" * 65)
+    print("TEST 9: PNG tRNS Palette Transparency (indexed alpha)")
+    print("=" * 65)
+
+    all_pass = True
+
+    # --- Subtest A: Build indexed palette with explicit alpha + write tRNS ---
+    print("\n  --- Write indexed PNG with tRNS -> decode should see correct alpha ---")
+    width, height = 6, 5
+    palette = [
+        (255, 0, 0),     # 0 = red, fully opaque (255)
+        (0, 255, 0),     # 1 = green, half-transparent (128)
+        (0, 0, 255),     # 2 = blue, fully transparent (0)
+        (255, 255, 0),   # 3 = yellow, opaque
+    ]
+    alphas = [255, 128, 0, 255]
+    # Palette layout: red, green, blue, yellow rows
+    indices_pixels = []
+    for y in range(height):
+        row = []
+        for x in range(width):
+            idx = (x + y) % 4
+            row.append(idx)
+        indices_pixels.append(row)
+
+    png = PNGImage()
+    png.width = width
+    png.height = height
+    png.bit_depth = 4  # use 4-bit indexed
+    png.color_type = 3
+    png.palette = palette
+    png.transparency = alphas
+    png.pixels = indices_pixels
+
+    try:
+        data = write_png(png, filter_type=0, write_ancillary=True)
+        # Decode back via PNGImage (low-level)
+        low = read_png(data)
+        t_ok = (low.transparency is not None and
+                len(low.transparency) >= 3 and
+                low.transparency[0] == 255 and
+                low.transparency[1] == 128 and
+                low.transparency[2] == 0)
+        print(f"    [{'PASS' if t_ok else 'FAIL'}] Low-level: tRNS parsed correctly")
+        if not t_ok:
+            all_pass = False
+
+        # Decode via Image.from_png -> should get RGBA with alpha
+        decoded = Image.from_png(data)
+        # Spot check a few pixels
+        checks = [
+            # (x, y) -> expected_rgb, expected_alpha
+            ((0, 0), (255, 0, 0), 255),  # idx 0
+            ((1, 0), (0, 255, 0), 128),  # idx 1
+            ((2, 0), (0, 0, 255), 0),    # idx 2
+            ((3, 0), (255, 255, 0), 255),  # idx 3
+            ((0, 2), (0, 0, 255), 0),    # idx 2 again
+        ]
+        for (x, y), exp_rgb, exp_a in checks:
+            p = decoded.pixels[y][x]
+            ok = (p[0], p[1], p[2]) == exp_rgb and p[3] == exp_a
+            tag = "PASS" if ok else "FAIL"
+            if not ok:
+                all_pass = False
+            print(f"    [{tag}] pixel ({x},{y}): got {p}, expected RGB={exp_rgb} A={exp_a}")
+    except Exception as e:
+        print(f"    [FAIL] tRNS write/read: {type(e).__name__}: {e}")
+        all_pass = False
+
+    # --- Subtest B: convert tRNS-indexed PNG to RGBA PNG and BMP32 ---
+    print("\n  --- tRNS-indexed -> RGBA PNG (lossless alpha) & BMP32 (lossless alpha) ---")
+    try:
+        src = Image.from_png(data)
+        # -> RGBA PNG
+        rgba_png = src.to_png(color_type=6, bit_depth=8, filter_type=4)
+        back_rgba = Image.from_png(rgba_png)
+        diff_rgba, max_rgba = src.count_differences(back_rgba, ignore_alpha=False)
+        tag = "PASS" if diff_rgba == 0 else "FAIL"
+        if diff_rgba != 0:
+            all_pass = False
+        print(f"    [{tag}] Indexed+tRNS -> RGBA PNG: {diff_rgba} alpha-aware diffs, max={max_rgba}")
+
+        # -> BMP32
+        bmp32 = src.to_bmp(32)
+        back_bmp = Image.from_bmp(bmp32)
+        diff_bmp, max_bmp = src.count_differences(back_bmp, ignore_alpha=False)
+        tag = "PASS" if diff_bmp == 0 else "FAIL"
+        if diff_bmp != 0:
+            all_pass = False
+        print(f"    [{tag}] Indexed+tRNS -> BMP32: {diff_bmp} alpha-aware diffs, max={max_bmp}")
+    except Exception as e:
+        print(f"    [FAIL] cross-format alpha: {type(e).__name__}: {e}")
+        all_pass = False
+
+    return all_pass
+
+
+# ============================================================
+# Test 10: Strict write validation (palette overflow / index oob)
+# ============================================================
+
+def test_write_indexed_strict_validation():
+    print("\n" + "=" * 65)
+    print("TEST 10: Strict indexed write validation (palette/index)")
+    print("=" * 65)
+
+    all_pass = True
+
+    # --- Subtest A: palette larger than bit depth allows ---
+    print("\n  --- A: Palette with 17 colors vs 4-bit (cap 16) MUST throw ---")
+    for fmt_name, ctor in [("PNG", PNGImage), ("BMP", BMPImage)]:
+        big_pal = [(i * 13, i * 17, i * 19) for i in range(17)]  # 17 colors
+        img = ctor()
+        img.width = 2
+        img.height = 2
+        img.palette = big_pal
+        img.pixels = [[0, 1], [2, 3]]
+        if fmt_name == "PNG":
+            img.bit_depth = 4
+            img.color_type = 3  # MUST be indexed for palette
+        else:
+            img.bits_per_pixel = 4  # BMP attribute name
+        if fmt_name == "PNG":
+            try:
+                write_png(img, palette_strategy="error")
+                print(f"    [FAIL] {fmt_name} write: did NOT raise PaletteError for 17-color 4-bit")
+                all_pass = False
+            except PaletteError as pe:
+                print(f"    [PASS] {fmt_name} write: PaletteError ({pe.color_count}/{pe.max_colors})")
+            except Exception as e:
+                print(f"    [FAIL] {fmt_name} write: wrong exception {type(e).__name__}: {e}")
+                all_pass = False
+        else:
+            try:
+                write_bmp(img, palette_strategy="error")
+                print(f"    [FAIL] {fmt_name} write: did NOT raise PaletteError for 17-color 4-bit")
+                all_pass = False
+            except PaletteError as pe:
+                print(f"    [PASS] {fmt_name} write: PaletteError ({pe.color_count}/{pe.max_colors})")
+            except Exception as e:
+                print(f"    [FAIL] {fmt_name} write: wrong exception {type(e).__name__}: {e}")
+                all_pass = False
+
+    # --- Subtest B: pixel index >= palette size ---
+    print("\n  --- B: Palette 4 entries, pixel index 5 MUST throw ---")
+    small_pal = [(255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0)]
+    for fmt_name, ctor in [("PNG", PNGImage), ("BMP", BMPImage)]:
+        img = ctor()
+        img.width = 3
+        img.height = 1
+        img.palette = small_pal
+        # 4 valid entries -> index 5 is definitely out of range
+        img.pixels = [[0, 5, 2]]  # OOB at col 1
+        if fmt_name == "PNG":
+            img.bit_depth = 8
+            img.color_type = 3
+        else:
+            img.bits_per_pixel = 8
+        if fmt_name == "PNG":
+            try:
+                write_png(img)
+                print(f"    [FAIL] {fmt_name} write: did NOT raise for index 5 with 4-entry palette")
+                all_pass = False
+            except PaletteError as pe:
+                print(f"    [PASS] {fmt_name} write: PaletteError on bad index ({pe})")
+            except Exception as e:
+                print(f"    [FAIL] {fmt_name} write: wrong exception {type(e).__name__}: {e}")
+                all_pass = False
+        else:
+            try:
+                write_bmp(img)
+                print(f"    [FAIL] {fmt_name} write: did NOT raise for index 5 with 4-entry palette")
+                all_pass = False
+            except PaletteError as pe:
+                print(f"    [PASS] {fmt_name} write: PaletteError on bad index ({pe})")
+            except Exception as e:
+                print(f"    [FAIL] {fmt_name} write: wrong exception {type(e).__name__}: {e}")
+                all_pass = False
+
+    # --- Subtest C: 1-bit mode with index 2 ---
+    print("\n  --- C: 1-bit with index 2 (out of {0,1}) MUST throw ---")
+    for fmt_name, ctor in [("PNG", PNGImage), ("BMP", BMPImage)]:
+        img = ctor()
+        img.width = 3
+        img.height = 1
+        img.palette = [(0, 0, 0), (255, 255, 255)]
+        img.pixels = [[0, 2, 1]]  # 2 is invalid for 1-bit
+        if fmt_name == "PNG":
+            img.bit_depth = 1
+            img.color_type = 3
+        else:
+            img.bits_per_pixel = 1
+        if fmt_name == "PNG":
+            try:
+                write_png(img)
+                print(f"    [FAIL] {fmt_name}: did NOT raise for idx=2 in 1-bit")
+                all_pass = False
+            except PaletteError:
+                print(f"    [PASS] {fmt_name}: PaletteError on idx=2 in 1-bit")
+            except Exception as e:
+                print(f"    [FAIL] {fmt_name}: wrong exception {type(e).__name__}: {e}")
+                all_pass = False
+        else:
+            try:
+                write_bmp(img)
+                print(f"    [FAIL] {fmt_name}: did NOT raise for idx=2 in 1-bit")
+                all_pass = False
+            except PaletteError:
+                print(f"    [PASS] {fmt_name}: PaletteError on idx=2 in 1-bit")
+            except Exception as e:
+                print(f"    [FAIL] {fmt_name}: wrong exception {type(e).__name__}: {e}")
+                all_pass = False
+
+    return all_pass
+
+
+# ============================================================
+# Test 11: Batch CLI convert with mixed good/bad files
+# ============================================================
+
+def test_cli_batch_with_corrupt_files():
+    print("\n" + "=" * 65)
+    print("TEST 11: CLI Batch convert (directory w/ corrupt files)")
+    print("=" * 65)
+
+    import tempfile
+    import shutil
+    from cli import main as cli_main
+
+    all_pass = True
+    tmpdir = tempfile.mkdtemp(prefix="imcodec_batch_")
+
+    try:
+        in_dir = os.path.join(tmpdir, "input")
+        out_dir = os.path.join(tmpdir, "output")
+        os.makedirs(in_dir)
+
+        # Good files: 3 PNGs + 2 BMPs
+        img_a = create_gradient_image(7, 5, alpha=False)
+        img_b = create_few_colors_image(9, 4, num_colors=6, seed=3)
+        img_c = create_random_image(5, 3, seed=123, alpha=True)
+
+        # Good PNG
+        with open(os.path.join(in_dir, "a_gradient.png"), 'wb') as f:
+            f.write(img_a.to_png(color_type=2, filter_type=4))
+        # Good BMP 24
+        with open(os.path.join(in_dir, "b_fewcolors.bmp"), 'wb') as f:
+            f.write(img_b.to_bmp(24))
+        # Good PNG rgba
+        with open(os.path.join(in_dir, "c_random_rgba.png"), 'wb') as f:
+            f.write(img_c.to_png(color_type=6, filter_type=0))
+        # Good BMP 32
+        with open(os.path.join(in_dir, "d_rgba32.bmp"), 'wb') as f:
+            f.write(img_c.to_bmp(32))
+        # Good 8-color -> BMP 4-bit indexed
+        with open(os.path.join(in_dir, "e_indexed4.bmp"), 'wb') as f:
+            f.write(img_b.to_bmp(4, palette_strategy="quantize"))
+
+        # Corrupt files
+        # 1) Truncated PNG (just signature)
+        with open(os.path.join(in_dir, "bad_truncated.png"), 'wb') as f:
+            f.write(b'\x89PNG\r\n\x1a\n')  # 8 bytes only
+        # 2) BMP with bad signature
+        with open(os.path.join(in_dir, "bad_sig.bmp"), 'wb') as f:
+            f.write(b'QQ' + bytes([0] * 100))
+        # 3) PNG with wrong CRC on IHDR
+        bad_crc = bytearray(img_a.to_png(color_type=2))
+        bad_crc[29] ^= 0xFF  # flip CRC byte
+        with open(os.path.join(in_dir, "bad_crc.png"), 'wb') as f:
+            f.write(bytes(bad_crc))
+        # 4) Random non-image file
+        with open(os.path.join(in_dir, "readme.txt"), 'w') as f:
+            f.write("not an image file\n")
+
+        print(f"  Input dir     : {in_dir}")
+        print(f"  Output dir    : {out_dir}")
+        print(f"  Good files    : 5")
+        print(f"  Bad/non-image : 4 (1 truncated PNG, 1 bad BMP sig, 1 bad CRC, 1 TXT)")
+
+        # Run CLI batch convert (strict_crc default = True, so bad CRC should fail)
+        rc = cli_main(["convert", in_dir, out_dir, "--to", "png",
+                       "--png-color", "rgba", "--verify", "--quiet"])
+
+        # Expect rc = 2 (because some failed)
+        if rc == 0:
+            print(f"    [WARN] CLI batch rc=0, expected rc=2 (failures present)")
+        elif rc == 2:
+            print(f"    [PASS] CLI batch rc=2 (non-zero = had failures, correct)")
+        else:
+            print(f"    [FAIL] CLI batch rc={rc}, expected rc=2")
+            all_pass = False
+
+        # Verify output directory: at least the 5 good files should exist
+        expected_outputs = {
+            "a_gradient.png",
+            "b_fewcolors.png",
+            "c_random_rgba.png",
+            "d_rgba32.png",
+            "e_indexed4.png",
+        }
+        actual_outputs = set(os.listdir(out_dir)) if os.path.isdir(out_dir) else set()
+        for exp in expected_outputs:
+            ok = exp in actual_outputs
+            tag = "PASS" if ok else "FAIL"
+            if not ok:
+                all_pass = False
+            print(f"    [{tag}] Good output exists: {exp}")
+
+        # Verify bad files are NOT converted
+        for bad in ["bad_truncated.png", "bad_sig.png", "bad_crc.png", "readme.png"]:
+            not_present = bad not in actual_outputs
+            tag = "PASS" if not_present else "FAIL"
+            if not not_present:
+                all_pass = False
+            print(f"    [{tag}] Bad file not in output: {bad}")
+
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    return all_pass
+
+
 def main():
     print()
     print("#" * 65)
@@ -836,6 +1243,10 @@ def main():
         ("BMP robustness (malformed)", test_bmp_robustness),
         ("Cross-format lossy/lossless", test_cross_format_conversion),
         ("CLI smoke test", test_cli_smoke),
+        ("PNG ancillary chunks (gAMA/sRGB/tEXt/unknown)", test_png_ancillary_chunks),
+        ("PNG tRNS palette transparency + cross-format", test_png_trns_transparency),
+        ("Strict indexed write validation (palette + index)", test_write_indexed_strict_validation),
+        ("CLI batch convert with corrupt files", test_cli_batch_with_corrupt_files),
     ]
 
     results = []

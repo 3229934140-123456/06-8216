@@ -146,7 +146,7 @@ class PNGImage:
     def __init__(self):
         self.width = 0
         self.height = 0
-        self.bit_depth = 8
+        self.bit_depth = 0
         self.color_type = 6
         self.compression = 0
         self.filter = 0
@@ -157,6 +157,19 @@ class PNGImage:
         self.compressed_idat_size = 0
         self.idat_chunk_count = 0
         self.chunks_found = []
+        # Ancillary / transparency for tRNS: list of alpha per palette index (for color_type 3)
+        self.transparency = None
+        # Standard ancillary chunks
+        self.gama = None  # float gamma value (e.g. 1/2.2 ≈ 0.45455)
+
+        self.srgb = None  # int 0-3 rendering intent
+        self.phys = None  # (ppux, ppuy, unit) - pHYs chunk
+        # tEXt chunks: list of (keyword, text_string)
+
+        self.text_chunks = []
+        # Unknown/unhandled chunks: list of (chunk_name_str, data_length, order_index)
+
+        self.unknown_chunks = []
 
     @property
     def channels(self):
@@ -184,6 +197,30 @@ class PNGImage:
         lines.append(f"  Channels  : {self.channels}")
         if self.palette:
             lines.append(f"  Palette   : {len(self.palette)} entries")
+        if self.transparency is not None:
+            if self.color_type == 3:
+                n_trans = sum(1 for a in self.transparency if a < 255)
+                lines.append(f"  tRNS      : {len(self.transparency)} alpha entries, {n_trans} non-opaque")
+            else:
+                lines.append(f"  tRNS      : chroma-key transparency {self.transparency}")
+        if self.gama is not None:
+            lines.append(f"  gAMA      : {self.gama:.5f}  (1/gamma ≈ {1.0/self.gama:.3f})")
+        if self.srgb is not None:
+            intent_names = ["Perceptual", "Relative colorimetric", "Saturation", "Absolute colorimetric"]
+            lines.append(f"  sRGB      : intent {self.srgb} ({intent_names[self.srgb] if 0<=self.srgb<=3 else 'Unknown'})")
+        if self.phys is not None:
+            ppux, ppuy, unit = self.phys
+            unit_name = "unknown" if unit == 0 else "meter"
+            lines.append(f"  pHYs      : {ppux}x{ppuy} pixels per {unit_name}")
+        if self.text_chunks:
+            lines.append(f"  tEXt chunks: {len(self.text_chunks)}")
+            for kw, txt in self.text_chunks:
+                preview = txt if len(txt) < 60 else (txt[:57] + "...")
+                lines.append(f"    - {kw}: {preview!r}")
+        if self.unknown_chunks:
+            lines.append(f"  Unhandled chunks: {len(self.unknown_chunks)}")
+            for name, length, order in self.unknown_chunks:
+                lines.append(f"    #{order}: '{name}' ({length} bytes)")
         if self.idat_chunk_count:
             lines.append(f"  IDAT chunks: {self.idat_chunk_count}")
             lines.append(f"  Compressed  : {self.compressed_idat_size:,} bytes")
@@ -359,10 +396,86 @@ def read_png(data, strict_crc=True):
             iend_seen = True
             break
 
-        else:
-            is_critical = (chunk.chunk_type[0] & 0x20) == 0
-            if is_critical:
+        elif ct == b'tRNS':
+            if not ihdr_seen:
+                raise PNGError("ORDER", "tRNS appeared before IHDR", details={"chunk": "tRNS"})
+            if img.color_type == 3:
+                if not img.palette:
+                    raise PNGError("ORDER", "tRNS appeared before PLTE (must come after)", details={"chunk": "tRNS"})
+                if img.idat_chunk_count > 0:
+                    raise PNGError("ORDER", "tRNS appeared after IDAT (must come before)", details={"chunk": "tRNS"})
+                alpha_list = list(chunk.data)
+                while len(alpha_list) < len(img.palette):
+                    alpha_list.append(255)
+                img.transparency = alpha_list[:len(img.palette)]
+            elif img.color_type == 0:
+                if len(chunk.data) == 2:
+                    gray_val = struct.unpack_from('>H', chunk.data, 0)[0]
+                    img.transparency = gray_val
+            elif img.color_type == 2:
+                if len(chunk.data) == 6:
+                    r, g, b = struct.unpack_from('>HHH', chunk.data, 0)
+                    img.transparency = (r, g, b)
+
+        elif ct == b'gAMA':
+            if len(chunk.data) == 4:
+                gamma_int = struct.unpack_from('>I', chunk.data, 0)[0]
+                img.gama = gamma_int / 100000.0
+
+        elif ct == b'sRGB':
+            if len(chunk.data) == 1:
+                intent = chunk.data[0]
+                if 0 <= intent <= 3:
+                    img.srgb = intent
+
+        elif ct == b'pHYs':
+            if len(chunk.data) == 9:
+                ppux, ppuy = struct.unpack_from('>II', chunk.data, 0)
+                unit = chunk.data[8]
+                img.phys = (ppux, ppuy, unit)
+
+        elif ct == b'tEXt':
+            try:
+                nul_pos = chunk.data.find(b'\x00')
+                if nul_pos > 0:
+                    keyword = chunk.data[:nul_pos].decode('latin-1')
+                    text = chunk.data[nul_pos + 1:].decode('latin-1')
+                    img.text_chunks.append((keyword, text))
+            except Exception:
                 pass
+
+        elif ct == b'iTXt':
+            try:
+                parts = chunk.data.split(b'\x00')
+                if len(parts) >= 3:
+                    keyword = parts[0].decode('latin-1')
+                    try:
+                        text = parts[-1].decode('utf-8')
+                    except Exception:
+                        text = parts[-1].decode('latin-1', errors='replace')
+                    img.text_chunks.append((keyword, text))
+            except Exception:
+                pass
+
+        elif ct == b'zTXt':
+            try:
+                nul_pos = chunk.data.find(b'\x00')
+                if nul_pos > 0 and nul_pos + 2 < len(chunk.data):
+                    keyword = chunk.data[:nul_pos].decode('latin-1')
+                    method = chunk.data[nul_pos + 1]
+                    if method == 0:
+                        comp = chunk.data[nul_pos + 2:]
+                        try:
+                            text = zlib.decompress(comp).decode('latin-1')
+                        except Exception:
+                            text = f"<{len(comp)} compressed bytes, decompress failed>"
+                        img.text_chunks.append((keyword, text))
+            except Exception:
+                pass
+
+        else:
+            name = ct.decode('ascii', errors='replace')
+            img.unknown_chunks.append((name, len(chunk.data), idx))
 
     if not ihdr_seen:
         raise PNGError("MISSING_CHUNK", "No IHDR chunk found - file is corrupt",
@@ -524,7 +637,8 @@ def _decode_pixels(raw_rows, img):
     return pixels
 
 
-def write_png(img, filter_type=0, palette_strategy="quantize", idat_split=None):
+def write_png(img, filter_type=0, palette_strategy="quantize", idat_split=None,
+              extra_chunks=None, write_ancillary=True):
     _init_filter_fns()
 
     width = img.width
@@ -538,12 +652,53 @@ def write_png(img, filter_type=0, palette_strategy="quantize", idat_split=None):
         img.palette = quant.palette
         img.pixels = quant.indices
 
+    # ======= Strict validation before writing (prevents read-back color corruption) =======
+    pal_capacity = 1 << bit_depth
+    if color_type == 3:
+        if img.palette is None:
+            raise PaletteError(
+                f"Cannot write indexed PNG ({bit_depth}-bit) without palette.",
+                color_count=0, max_colors=pal_capacity
+            )
+        if len(img.palette) > pal_capacity:
+            raise PaletteError(
+                f"Palette has {len(img.palette)} entries but {bit_depth}-bit indexed mode "
+                f"can only hold {pal_capacity}. Reduce palette size or increase bit depth.",
+                color_count=len(img.palette), max_colors=pal_capacity
+            )
+        # Validate all indices are in range
+        max_idx = len(img.palette) - 1
+        for y in range(height):
+            row = img.pixels[y]
+            for x in range(width):
+                idx = row[x]
+                if not isinstance(idx, int) or idx < 0 or idx > max_idx:
+                    raise PaletteError(
+                        f"Pixel index out of range at ({x},{y}): {idx}. "
+                        f"Palette size is {len(img.palette)} (valid: 0..{max_idx}).",
+                        color_count=idx, max_colors=len(img.palette)
+                    )
+
     result = bytearray()
     result.extend(PNG_SIGNATURE)
 
     ihdr_data = struct.pack('>II', width, height)
     ihdr_data += bytes([bit_depth, color_type, 0, 0, 0])
     result.extend(PNGChunk(b'IHDR', ihdr_data).encode())
+
+    # ======== Ancillary chunks (before PLTE/IDAT) ========
+    if write_ancillary:
+        if img.srgb is not None:
+            srgb_data = bytes([img.srgb & 0xFF])
+            result.extend(PNGChunk(b'sRGB', srgb_data).encode())
+        if img.gama is not None:
+            gamma_int = max(0, min(4294967295, int(round(img.gama * 100000))))
+            gama_data = struct.pack('>I', gamma_int)
+            result.extend(PNGChunk(b'gAMA', gama_data).encode())
+        if img.phys is not None:
+            ppux, ppuy, unit = img.phys
+            phys_data = struct.pack('>II', ppux & 0xFFFFFFFF, ppuy & 0xFFFFFFFF) + bytes([unit & 0xFF])
+            result.extend(PNGChunk(b'pHYs', phys_data).encode())
 
     if color_type == 3 and img.palette:
         plte_data = bytearray()
@@ -552,6 +707,42 @@ def write_png(img, filter_type=0, palette_strategy="quantize", idat_split=None):
             plte_data.append(color[1])
             plte_data.append(color[2])
         result.extend(PNGChunk(b'PLTE', bytes(plte_data)).encode())
+
+        # tRNS: if transparency is provided or some palette entries are not opaque
+        if write_ancillary and img.transparency is not None:
+            trans_bytes = bytearray()
+            for alpha in img.transparency[:len(img.palette)]:
+                trans_bytes.append(max(0, min(255, alpha)))
+            # Trim trailing 255s to save space
+            while trans_bytes and trans_bytes[-1] == 255:
+                trans_bytes.pop()
+            if trans_bytes:
+                result.extend(PNGChunk(b'tRNS', bytes(trans_bytes)).encode())
+
+    # tEXt chunks (after PLTE if any, before IDAT)
+    if write_ancillary and getattr(img, 'text_chunks', None):
+        for keyword, text in img.text_chunks:
+            try:
+                kw_bytes = keyword.encode('latin-1')[:79]
+                tx_bytes = text.encode('latin-1')
+                tdata = kw_bytes + b'\x00' + tx_bytes
+                if len(kw_bytes) > 0:
+                    result.extend(PNGChunk(b'tEXt', tdata).encode())
+            except Exception:
+                pass
+
+    # Caller-provided extra chunks (e.g. custom tEXt, unknown chunks for testing)
+    if extra_chunks:
+        for chunk in extra_chunks:
+            if isinstance(chunk, PNGChunk):
+                result.extend(chunk.encode())
+            elif isinstance(chunk, tuple) and len(chunk) == 2:
+                ctype, cdata = chunk
+                if isinstance(ctype, str):
+                    ctype = ctype.encode('ascii')
+                if isinstance(cdata, str):
+                    cdata = cdata.encode('latin-1')
+                result.extend(PNGChunk(ctype, bytes(cdata)).encode())
 
     raw_rows = _encode_pixels(img)
 

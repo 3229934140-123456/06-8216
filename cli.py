@@ -115,55 +115,63 @@ def _parse_extra_options(extra_str):
     return opts
 
 
-def cmd_convert(args):
-    in_path = args.input
-    out_path = args.output
+def _convert_single(in_path, out_path, args, verbose=True):
+    """Convert a single file in_path -> out_path.
+    Returns dict with keys: ok, in_size, out_size, lossy, diff_count, max_diff, error.
+    """
+    result = {"ok": False, "in_size": 0, "out_size": 0, "lossy": False,
+              "diff_count": None, "max_diff": None, "error": None}
 
-    if not os.path.exists(in_path):
-        print(f"Input file not found: {in_path}")
-        return 1
+    extra = _parse_extra_options(args.options)
 
     in_fmt = detect_format(in_path) or args.from_fmt
     out_fmt = detect_format(out_path) or args.to_fmt
-
     if not in_fmt:
+        try:
+            with open(in_path, 'rb') as f:
+                sig = f.read(16)
+            if sig[:2] == b'BM':
+                in_fmt = 'bmp'
+            elif sig[:8] == b'\x89PNG\r\n\x1a\n':
+                in_fmt = 'png'
+        except Exception:
+            pass
+    if not in_fmt or not out_fmt:
+        result["error"] = f"Cannot detect format for {'input' if not in_fmt else 'output'}"
+        return result
+
+    try:
+        in_size = os.path.getsize(in_path)
+        result["in_size"] = in_size
         with open(in_path, 'rb') as f:
-            sig = f.read(16)
-        if sig[:2] == b'BM':
-            in_fmt = 'bmp'
-        elif sig[:8] == b'\x89PNG\r\n\x1a\n':
-            in_fmt = 'png'
-    if not out_fmt:
-        print(f"Cannot detect output format for {out_path}, use --to")
-        return 1
+            in_data = f.read()
+    except Exception as e:
+        result["error"] = f"Read failed: {e}"
+        return result
 
-    in_size = os.path.getsize(in_path)
-    with open(in_path, 'rb') as f:
-        in_data = f.read()
-
-    print(f"\n--- Converting: {in_path} ({in_fmt.upper()}) -> {out_path} ({out_fmt.upper()}) ---")
-    print(f"  Input size : {in_size:,} bytes")
+    if verbose:
+        print(f"\n--- Converting: {in_path} ({in_fmt.upper()}) -> {out_path} ({out_fmt.upper()}) ---")
+        print(f"  Input size : {in_size:,} bytes")
 
     try:
         img = Image.from_file(in_data, fmt=in_fmt)
-        print()
-        print("--- Input decoded ---")
-        print(img.describe())
-
-        extra = _parse_extra_options(args.options)
+        if verbose:
+            print()
+            print("--- Input decoded ---")
+            print(img.describe())
 
         if out_fmt == 'bmp':
             bpp = args.bmp_bpp or extra.get('bpp', 24)
             strategy = args.palette_strategy or extra.get('strategy', 'quantize')
             out_data = img.to_bmp(bits_per_pixel=bpp, palette_strategy=strategy)
-            if bpp <= 8:
+            if verbose and bpp <= 8:
                 qi = img.last_quantization_info
                 if qi and qi.is_lossy:
                     print()
                     print("--- Palette quantization (lossy) ---")
                     print(f"  Original unique colors : {qi.original_colors}")
                     print(f"  Palette size           : {qi.palette_colors} ({bpp}-bit = {1 << bpp} slots)")
-                    exact_pct = 100 * qi.exact_match_count / qi.total_pixels
+                    exact_pct = 100 * qi.exact_match_count / qi.total_pixels if qi.total_pixels else 0
                     print(f"  Exact matches          : {qi.exact_match_count:,}/{qi.total_pixels:,} ({exact_pct:.1f}%)")
                     print(f"  Max distance           : {qi.max_error}")
         else:
@@ -184,59 +192,200 @@ def cmd_convert(args):
                                   filter_type=filter_type, palette_strategy=strategy,
                                   idat_split=split)
 
-            print()
-            print("--- PNG encoder ---")
-            print(f"  Color type  : {color_type} ({COLOR_TYPE_NAMES.get(color_type, 'Unknown')})")
-            print(f"  Bit depth   : {bit_depth}")
-            print(f"  Filter      : {filter_type} ({FILTER_NAMES.get(filter_type, '?')})")
+            if verbose:
+                print()
+                print("--- PNG encoder ---")
+                print(f"  Color type  : {color_type} ({COLOR_TYPE_NAMES.get(color_type, 'Unknown')})")
+                print(f"  Bit depth   : {bit_depth}")
+                print(f"  Filter      : {filter_type} ({FILTER_NAMES.get(filter_type, '?')})")
 
-            if color_type == 3:
-                qi = img.last_quantization_info
-                if qi:
-                    print(f"  Palette     : {qi.palette_colors} colors")
-                    if qi.is_lossy:
-                        exact_pct = 100 * qi.exact_match_count / qi.total_pixels
-                        print(f"  Quantized   : {qi.original_colors} -> {qi.palette_colors} colors")
-                        print(f"  Exact match : {exact_pct:.1f}%")
+                if color_type == 3:
+                    qi = img.last_quantization_info
+                    if qi:
+                        print(f"  Palette     : {qi.palette_colors} colors")
+                        if qi.is_lossy:
+                            exact_pct = 100 * qi.exact_match_count / qi.total_pixels if qi.total_pixels else 0
+                            print(f"  Quantized   : {qi.original_colors} -> {qi.palette_colors} colors")
+                            print(f"  Exact match : {exact_pct:.1f}%")
+
+        out_dir = os.path.dirname(out_path)
+        if out_dir and not os.path.exists(out_dir):
+            os.makedirs(out_dir, exist_ok=True)
 
         with open(out_path, 'wb') as f:
             f.write(out_data)
+        result["out_size"] = len(out_data)
 
-        print()
-        print("--- Output written ---")
-        print(f"  File       : {out_path}")
-        print(f"  Bytes      : {len(out_data):,}")
-        if in_size > 0:
-            ratio = len(out_data) / in_size
-            direction = "smaller" if ratio < 1 else "larger"
-            print(f"  Ratio      : {ratio:.2f}x ({direction})")
+        if verbose:
+            print()
+            print("--- Output written ---")
+            print(f"  File       : {out_path}")
+            print(f"  Bytes      : {len(out_data):,}")
+            if in_size > 0:
+                ratio = len(out_data) / in_size
+                direction = "smaller" if ratio < 1 else "larger"
+                print(f"  Ratio      : {ratio:.2f}x ({direction})")
 
         if args.verify:
-            print()
-            print("--- Round-trip verification ---")
+            if verbose:
+                print()
+                print("--- Round-trip verification ---")
             try:
                 with open(out_path, 'rb') as f:
                     back = f.read()
                 img2 = Image.from_file(back, fmt=out_fmt)
                 diff_count, max_diff = img.count_differences(img2, ignore_alpha=True)
+                total = img.width * img.height * 3
+                result["diff_count"] = diff_count
+                result["max_diff"] = max_diff
                 if diff_count == 0:
-                    print(f"  Result: LOSSLESS (0 channel differences)")
+                    if verbose:
+                        print(f"  Result: LOSSLESS (0 channel differences)")
                 else:
-                    total = img.width * img.height * 3
-                    pct = 100 * diff_count / total
-                    print(f"  Result: LOSSY ({diff_count:,}/{total:,} channel diffs = {pct:.3f}%)")
-                    print(f"  Max per-channel difference: {max_diff}")
+                    result["lossy"] = True
+                    pct = 100 * diff_count / total if total else 0
+                    if verbose:
+                        print(f"  Result: LOSSY ({diff_count:,}/{total:,} channel diffs = {pct:.3f}%)")
+                        print(f"  Max per-channel difference: {max_diff}")
             except Exception as e:
-                print(f"  Verification failed: {e}")
+                result["error"] = f"Verification failed: {e}"
+                if verbose:
+                    print(f"  Verification failed: {e}")
+
+        result["ok"] = True
 
     except (BMPError, PNGError, PaletteError) as e:
-        print_error(e, in_fmt)
-        return 1
+        result["error"] = f"{type(e).__name__}: {e}"
+        if verbose:
+            print_error(e, in_fmt)
     except Exception as e:
-        print_error(e, in_fmt)
+        result["error"] = f"{type(e).__name__}: {e}"
+        if verbose:
+            print_error(e, in_fmt)
+
+    return result
+
+
+def cmd_convert(args):
+    in_path = args.input
+    out_path = args.output
+
+    in_is_dir = os.path.isdir(in_path)
+    out_ext = os.path.splitext(out_path)[1]
+    out_exists_dir = os.path.isdir(out_path) if os.path.exists(out_path) else False
+    out_looks_like_dir = (
+        out_exists_dir or
+        out_path.endswith(os.sep) or
+        (not os.path.exists(out_path) and out_ext == '')
+    )
+    out_is_dir = in_is_dir or out_looks_like_dir  # batch when either side is a directory
+
+    if not in_is_dir and not out_is_dir:
+        # Single file mode
+        if not os.path.exists(in_path):
+            print(f"Input file not found: {in_path}")
+            return 1
+        r = _convert_single(in_path, out_path, args, verbose=True)
+        return 0 if r["ok"] else 1
+
+    # Batch (directory) mode
+    if not os.path.isdir(in_path):
+        print(f"Input directory not found: {in_path}")
         return 1
 
-    return 0
+    out_dir = out_path
+    if not os.path.exists(out_dir):
+        os.makedirs(out_dir, exist_ok=True)
+    if not os.path.isdir(out_dir):
+        print(f"Output must be a directory when input is a directory. Got: {out_dir}")
+        return 1
+
+    out_fmt = (args.to_fmt or '').lower()
+    if out_fmt not in ('bmp', 'png'):
+        # Try infer from --png-color / --bmp-bpp, otherwise default to png
+        if args.bmp_bpp:
+            out_fmt = 'bmp'
+        else:
+            out_fmt = 'png'
+
+    # Gather candidate input files
+    candidates = []
+    for root, dirs, files in os.walk(in_path):
+        for fn in files:
+            lower = fn.lower()
+            if lower.endswith('.bmp') or lower.endswith('.png') or lower.endswith('.dib'):
+                candidates.append(os.path.join(root, fn))
+    candidates.sort()
+
+    print()
+    print(f"=================================================================")
+    print(f"BATCH CONVERT: {len(candidates)} files found")
+    print(f"  Input dir  : {in_path}")
+    print(f"  Output dir : {out_dir}")
+    print(f"  Target fmt : {out_fmt.upper()}")
+    if args.verify:
+        print(f"  Verify     : enabled (lossy/lossless check per file)")
+    print(f"=================================================================")
+
+    total_in = 0
+    total_out = 0
+    succeeded = 0
+    failed = 0
+    lossless_cnt = 0
+    lossy_cnt = 0
+    per_file_failures = []
+
+    for idx, src in enumerate(candidates, 1):
+        rel = os.path.relpath(src, in_path)
+        base = os.path.splitext(os.path.basename(src))[0]
+        rel_dir = os.path.dirname(rel)
+        dst_dir = os.path.join(out_dir, rel_dir) if rel_dir else out_dir
+        dst = os.path.join(dst_dir, base + '.' + out_fmt)
+
+        print(f"\n[{idx}/{len(candidates)}] {rel}")
+        r = _convert_single(src, dst, args, verbose=not args.quiet)
+        total_in += r["in_size"]
+        total_out += r["out_size"]
+
+        if r["ok"]:
+            succeeded += 1
+            if args.verify:
+                if r["diff_count"] == 0:
+                    lossless_cnt += 1
+                elif r["lossy"]:
+                    lossy_cnt += 1
+        else:
+            failed += 1
+            per_file_failures.append((rel, r["error"]))
+            if args.quiet:
+                # Still print failures
+                print(f"  [FAIL] {r['error']}")
+
+    # Final summary
+    print()
+    print(f"=================================================================")
+    print(f"BATCH SUMMARY")
+    print(f"=================================================================")
+    print(f"  Files processed : {len(candidates)}")
+    print(f"  Succeeded       : {succeeded}")
+    print(f"  Failed          : {failed}")
+    if args.verify:
+        print(f"  Lossless        : {lossless_cnt}")
+        print(f"  Lossy           : {lossy_cnt}")
+    print(f"  Total input     : {total_in:,} bytes")
+    print(f"  Total output    : {total_out:,} bytes")
+    if total_in > 0:
+        ratio = total_out / total_in
+        direction = "smaller" if ratio < 1 else "larger"
+        print(f"  Overall ratio   : {ratio:.2f}x ({direction})")
+
+    if per_file_failures:
+        print()
+        print(f"  Failures:")
+        for rel, err in per_file_failures:
+            print(f"    - {rel}: {err}")
+
+    return 0 if failed == 0 else 2
 
 
 def cmd_decode(args):
@@ -414,11 +563,12 @@ Examples:
     p_inspect.add_argument('--decode-and-check', '-d', action='store_true', help='Also run full decode')
 
     p_conv = sub.add_parser('convert', help='Convert between BMP and PNG')
-    p_conv.add_argument('input', help='Input file')
-    p_conv.add_argument('output', help='Output file')
+    p_conv.add_argument('input', help='Input file or directory')
+    p_conv.add_argument('output', help='Output file or directory')
     p_conv.add_argument('--from', dest='from_fmt', choices=['bmp', 'png'])
     p_conv.add_argument('--to', dest='to_fmt', choices=['bmp', 'png'])
     p_conv.add_argument('--verify', action='store_true', help='Re-decode output and report lossiness')
+    p_conv.add_argument('--quiet', action='store_true', help='Batch mode: only print per-file failures + summary')
     p_conv.add_argument('--bmp-bpp', type=int, choices=[1, 2, 4, 8, 16, 24, 32], help='BMP bits per pixel')
     p_conv.add_argument('--png-color', help='PNG color type: rgb|rgba|indexed|gray or number')
     p_conv.add_argument('--png-depth', type=int, choices=[1, 2, 4, 8], help='PNG bit depth')

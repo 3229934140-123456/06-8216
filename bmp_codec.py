@@ -395,6 +395,20 @@ def write_bmp(img: BMPImage, palette_strategy="quantize") -> bytes:
                 color_count=palette_size, max_colors=max_palette
             )
 
+        # ======= Strict index range validation (prevents read-back corruption) =======
+        valid_max = palette_size - 1
+        for y in range(height):
+            row = img.pixels[y]
+            for x in range(width):
+                idx = row[x]
+                if not isinstance(idx, int) or idx < 0 or idx > valid_max:
+                    raise PaletteError(
+                        f"Pixel index out of range at ({x},{y}): {idx}. "
+                        f"Palette size is {palette_size} (valid: 0..{valid_max}). "
+                        f"Use quantize strategy or higher bit depth to avoid generating invalid files.",
+                        color_count=idx, max_colors=palette_size
+                    )
+
         palette_data = bytearray()
         for i in range(palette_size):
             r, g, b = img.palette[i][:3]
