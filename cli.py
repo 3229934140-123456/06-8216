@@ -115,12 +115,134 @@ def _parse_extra_options(extra_str):
     return opts
 
 
+def _image_has_alpha(img):
+    """Best-effort check: does an Image have any non-opaque alpha?"""
+    try:
+        src_ft = img.get_meta("source_format")
+        if src_ft == "png":
+            sct = img.get_meta("source_color_type")
+            if sct in (4, 6):
+                return True
+            if sct == 3 and img.get_meta("source_transparency") is not None:
+                trans = img.get_meta("source_transparency")
+                if isinstance(trans, list) and any(a < 255 for a in trans):
+                    return True
+        if src_ft == "bmp":
+            if img.get_meta("source_bpp") == 32:
+                return True
+    except Exception:
+        pass
+    # Scan a few pixels to be sure
+    try:
+        for y in range(min(img.height, 8)):
+            for x in range(min(img.width, 8)):
+                p = img.pixels[y][x]
+                if len(p) >= 4 and p[3] < 255:
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _output_has_alpha(out_fmt, args):
+    """Heuristic: does the target format+args produce alpha?"""
+    if out_fmt == 'bmp':
+        bpp = getattr(args, 'bmp_bpp', None) or 24
+        return bpp == 32
+    else:  # png
+        ct_map = {'rgb': 2, 'rgba': 6, 'indexed': 3, 'palette': 3, 'gray': 0, 'greyscale': 0, 'grayscale': 0}
+        ct_name = (getattr(args, 'png_color', None) or 'rgba').lower()
+        if ct_name.isdigit():
+            color_type = int(ct_name)
+        else:
+            color_type = ct_map.get(ct_name, 6)
+        return color_type in (4, 6)  # GrayAlpha or RGBA
+
+
+def _resolve_overwrite(target_path, policy):
+    """Given an output path and overwrite policy, return (final_path, should_write_bool).
+
+    Policies: always / never / rename / ask.
+    ask -> default to always (non-interactive).
+    """
+    if not os.path.exists(target_path):
+        return target_path, True
+    if policy == 'always' or policy == 'ask':
+        return target_path, True
+    if policy == 'never':
+        return target_path, False
+    if policy == 'rename':
+        base, ext = os.path.splitext(target_path)
+        i = 1
+        while True:
+            cand = f"{base}_{i}{ext}"
+            if not os.path.exists(cand):
+                return cand, True
+            i += 1
+    return target_path, True
+
+
+def _write_report(report_path, summary, per_file):
+    """Write a JSON or CSV batch report."""
+    ext = os.path.splitext(report_path)[1].lower()
+    rdir = os.path.dirname(report_path)
+    if rdir and not os.path.exists(rdir):
+        os.makedirs(rdir, exist_ok=True)
+
+    if ext == '.csv':
+        import csv
+        fields = ["input", "output", "ok", "in_fmt", "out_fmt", "in_size", "out_size",
+                  "lossiness", "diff_count", "max_diff", "note", "error"]
+        with open(report_path, 'w', newline='', encoding='utf-8') as f:
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction='ignore')
+            w.writeheader()
+            for r in per_file:
+                w.writerow(r)
+            w.writerow({
+                "input": "__SUMMARY__",
+                "output": "",
+                "ok": summary["failed"] == 0,
+                "in_fmt": "",
+                "out_fmt": "",
+                "in_size": summary["total_in"],
+                "out_size": summary["total_out"],
+                "lossiness": "",
+                "diff_count": "",
+                "max_diff": "",
+                "note": f"succeeded={summary['succeeded']}, failed={summary['failed']}, "
+                        f"lossless={summary.get('lossless_cnt', 0)}, lossy={summary.get('lossy_cnt', 0)}, "
+                        f"unchecked={summary.get('unchecked_cnt', 0)}",
+                "error": "",
+            })
+    else:
+        # Default: JSON
+        import json
+        payload = {
+            "summary": summary,
+            "files": per_file,
+        }
+        with open(report_path, 'w', encoding='utf-8') as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+
+
 def _convert_single(in_path, out_path, args, verbose=True):
     """Convert a single file in_path -> out_path.
-    Returns dict with keys: ok, in_size, out_size, lossy, diff_count, max_diff, error.
+    Returns dict with many fields for reporting.
     """
-    result = {"ok": False, "in_size": 0, "out_size": 0, "lossy": False,
-              "diff_count": None, "max_diff": None, "error": None}
+    result = {
+        "ok": False,
+        "input": in_path,
+        "output": out_path,
+        "in_size": 0,
+        "out_size": 0,
+        "in_fmt": None,
+        "out_fmt": None,
+        "lossiness": "unchecked",
+        "diff_count": None,
+        "max_diff": None,
+        "error": None,
+        "note": None,
+    }
 
     extra = _parse_extra_options(args.options)
 
@@ -138,7 +260,11 @@ def _convert_single(in_path, out_path, args, verbose=True):
             pass
     if not in_fmt or not out_fmt:
         result["error"] = f"Cannot detect format for {'input' if not in_fmt else 'output'}"
+        result["note"] = "format detection failed"
         return result
+
+    result["in_fmt"] = in_fmt
+    result["out_fmt"] = out_fmt
 
     try:
         in_size = os.path.getsize(in_path)
@@ -226,31 +352,80 @@ def _convert_single(in_path, out_path, args, verbose=True):
                 direction = "smaller" if ratio < 1 else "larger"
                 print(f"  Ratio      : {ratio:.2f}x ({direction})")
 
+        # --- Decide lossiness (alpha-aware) + heuristic when no --verify ---
+        source_has_alpha = _image_has_alpha(img)
+        target_has_alpha = _output_has_alpha(out_fmt, args)
+        qi = img.last_quantization_info
+        heur_lossy_reasons = []
+        if qi and qi.is_lossy:
+            heur_lossy_reasons.append(f"quantized {qi.original_colors}->{qi.palette_colors} colors")
+        if source_has_alpha and not target_has_alpha:
+            heur_lossy_reasons.append("alpha discarded")
+
         if args.verify:
             if verbose:
                 print()
-                print("--- Round-trip verification ---")
+                print("--- Round-trip verification (alpha-aware) ---")
             try:
                 with open(out_path, 'rb') as f:
                     back = f.read()
                 img2 = Image.from_file(back, fmt=out_fmt)
-                diff_count, max_diff = img.count_differences(img2, ignore_alpha=True)
-                total = img.width * img.height * 3
+                # Compare alpha only if both sides can carry it:
+                # If source had alpha but target doesn't support it, we still compare alpha
+                # to detect the alpha loss as "lossy".
+                compare_alpha = source_has_alpha
+                if compare_alpha and not target_has_alpha:
+                    # Alpha will be discarded; we expect 255 on target side.
+                    # Compare ignoring alpha for RGB channels, then separately count alpha diffs.
+                    diff_rgb, max_rgb = img.count_differences(img2, ignore_alpha=True)
+                    alpha_diff = 0
+                    max_ad = 0
+                    for y in range(img.height):
+                        for x in range(img.width):
+                            src_a = img.pixels[y][x][3]
+                            tgt_a = img2.pixels[y][x][3]
+                            if src_a != tgt_a:
+                                alpha_diff += 1
+                                max_ad = max(max_ad, abs(src_a - tgt_a))
+                    diff_count = diff_rgb + alpha_diff
+                    max_diff = max(max_rgb, max_ad)
+                    if verbose:
+                        print(f"  Note: source had alpha but target has none; counting alpha differences")
+                else:
+                    diff_count, max_diff = img.count_differences(img2, ignore_alpha=not compare_alpha)
                 result["diff_count"] = diff_count
                 result["max_diff"] = max_diff
+                total = img.width * img.height * (4 if compare_alpha else 3)
                 if diff_count == 0:
+                    result["lossiness"] = "lossless"
                     if verbose:
-                        print(f"  Result: LOSSLESS (0 channel differences)")
+                        print(f"  Result: LOSSLESS (0 channel differences, "
+                              f"alpha={'ON' if compare_alpha else 'OFF'})")
                 else:
-                    result["lossy"] = True
+                    result["lossiness"] = "lossy"
                     pct = 100 * diff_count / total if total else 0
                     if verbose:
                         print(f"  Result: LOSSY ({diff_count:,}/{total:,} channel diffs = {pct:.3f}%)")
                         print(f"  Max per-channel difference: {max_diff}")
+                        print(f"  Alpha compare: {'ON (alpha-preserving)' if compare_alpha else 'OFF (RGB only)'}")
             except Exception as e:
                 result["error"] = f"Verification failed: {e}"
+                result["lossiness"] = "unchecked"
                 if verbose:
                     print(f"  Verification failed: {e}")
+        else:
+            if heur_lossy_reasons:
+                result["lossiness"] = "likely-lossy"
+                result["note"] = "; ".join(heur_lossy_reasons)
+                if verbose:
+                    print()
+                    print(f"  Heuristic: LIKELY LOSSY ({result['note']})")
+            else:
+                result["lossiness"] = "likely-lossless"
+                result["note"] = "no obvious lossy steps detected"
+                if verbose:
+                    print()
+                    print("  Heuristic: LIKELY LOSSLESS (no --verify; re-check with --verify to confirm)")
 
         result["ok"] = True
 
@@ -285,7 +460,29 @@ def cmd_convert(args):
         if not os.path.exists(in_path):
             print(f"Input file not found: {in_path}")
             return 1
-        r = _convert_single(in_path, out_path, args, verbose=True)
+        # Handle overwrite policy for single file too
+        final_path, should_write = _resolve_overwrite(out_path, args.overwrite or 'always')
+        if not should_write:
+            print(f"Skipping (--overwrite=never): {out_path} exists")
+            return 0
+        r = _convert_single(in_path, final_path, args, verbose=True)
+        if args.report:
+            per = [r]
+            summary = {
+                "files_processed": 1,
+                "succeeded": 1 if r["ok"] else 0,
+                "failed": 0 if r["ok"] else 1,
+                "lossless_cnt": 1 if r["lossiness"] == "lossless" else 0,
+                "lossy_cnt": 1 if r["lossiness"] == "lossy" else 0,
+                "unchecked_cnt": 1 if r["lossiness"] in ("unchecked", "likely-lossy", "likely-lossless") else 0,
+                "total_in": r["in_size"],
+                "total_out": r["out_size"],
+            }
+            try:
+                _write_report(args.report, summary, per)
+                print(f"  Report written: {args.report}")
+            except Exception as e:
+                print(f"  Failed to write report: {e}")
         return 0 if r["ok"] else 1
 
     # Batch (directory) mode
@@ -302,19 +499,42 @@ def cmd_convert(args):
 
     out_fmt = (args.to_fmt or '').lower()
     if out_fmt not in ('bmp', 'png'):
-        # Try infer from --png-color / --bmp-bpp, otherwise default to png
         if args.bmp_bpp:
             out_fmt = 'bmp'
         else:
             out_fmt = 'png'
 
-    # Gather candidate input files
+    # Parse include extensions
+    include_ext_set = {'.bmp', '.png', '.dib'}
+    if args.include_ext:
+        include_ext_set = set()
+        for ext in args.include_ext.split(','):
+            ext = ext.strip().lower()
+            if not ext.startswith('.'):
+                ext = '.' + ext
+            include_ext_set.add(ext)
+
+    # Gather candidate input files (respect --recursive / --no-recursive)
     candidates = []
-    for root, dirs, files in os.walk(in_path):
-        for fn in files:
-            lower = fn.lower()
-            if lower.endswith('.bmp') or lower.endswith('.png') or lower.endswith('.dib'):
-                candidates.append(os.path.join(root, fn))
+    recursive = getattr(args, 'recursive', True)
+    keep_structure = getattr(args, 'keep_structure', True)
+    overwrite_policy = getattr(args, 'overwrite', 'always')
+
+    if recursive:
+        for root, dirs, files in os.walk(in_path):
+            for fn in files:
+                lower = fn.lower()
+                _, ext = os.path.splitext(lower)
+                if ext in include_ext_set:
+                    candidates.append(os.path.join(root, fn))
+    else:
+        for fn in os.listdir(in_path):
+            full = os.path.join(in_path, fn)
+            if os.path.isfile(full):
+                lower = fn.lower()
+                _, ext = os.path.splitext(lower)
+                if ext in include_ext_set:
+                    candidates.append(full)
     candidates.sort()
 
     print()
@@ -323,43 +543,72 @@ def cmd_convert(args):
     print(f"  Input dir  : {in_path}")
     print(f"  Output dir : {out_dir}")
     print(f"  Target fmt : {out_fmt.upper()}")
+    print(f"  Recursive  : {'yes' if recursive else 'no'}")
+    print(f"  Keep dirs  : {'yes' if keep_structure else 'no (flatten)'}")
+    print(f"  Overwrite  : {overwrite_policy}")
+    print(f"  Extensions : {', '.join(sorted(include_ext_set))}")
     if args.verify:
         print(f"  Verify     : enabled (lossy/lossless check per file)")
+    if args.report:
+        print(f"  Report     : {args.report}")
     print(f"=================================================================")
 
     total_in = 0
     total_out = 0
     succeeded = 0
     failed = 0
+    skipped = 0
     lossless_cnt = 0
     lossy_cnt = 0
+    unchecked_cnt = 0
+    per_file_results = []
     per_file_failures = []
 
     for idx, src in enumerate(candidates, 1):
         rel = os.path.relpath(src, in_path)
         base = os.path.splitext(os.path.basename(src))[0]
         rel_dir = os.path.dirname(rel)
-        dst_dir = os.path.join(out_dir, rel_dir) if rel_dir else out_dir
+        if keep_structure and rel_dir:
+            dst_dir = os.path.join(out_dir, rel_dir)
+        else:
+            dst_dir = out_dir
         dst = os.path.join(dst_dir, base + '.' + out_fmt)
 
-        print(f"\n[{idx}/{len(candidates)}] {rel}")
-        r = _convert_single(src, dst, args, verbose=not args.quiet)
+        final_dst, should_write = _resolve_overwrite(dst, overwrite_policy)
+        if not should_write:
+            skipped += 1
+            skipped_r = {
+                "ok": False, "input": src, "output": dst,
+                "in_size": 0, "out_size": 0, "in_fmt": None, "out_fmt": None,
+                "lossiness": "unchecked", "diff_count": None, "max_diff": None,
+                "error": None, "note": f"skipped (exists, --overwrite={overwrite_policy})",
+            }
+            per_file_results.append(skipped_r)
+            if not args.quiet:
+                print(f"\n[{idx}/{len(candidates)}] {rel}")
+                print(f"  [SKIP] exists (--overwrite={overwrite_policy})")
+            continue
+
+        if not args.quiet:
+            print(f"\n[{idx}/{len(candidates)}] {rel}")
+        r = _convert_single(src, final_dst, args, verbose=not args.quiet)
+        per_file_results.append(r)
         total_in += r["in_size"]
         total_out += r["out_size"]
 
         if r["ok"]:
             succeeded += 1
-            if args.verify:
-                if r["diff_count"] == 0:
-                    lossless_cnt += 1
-                elif r["lossy"]:
-                    lossy_cnt += 1
+            if r["lossiness"] == "lossless":
+                lossless_cnt += 1
+            elif r["lossiness"] == "lossy":
+                lossy_cnt += 1
+            else:
+                unchecked_cnt += 1
         else:
             failed += 1
             per_file_failures.append((rel, r["error"]))
             if args.quiet:
-                # Still print failures
-                print(f"  [FAIL] {r['error']}")
+                print(f"  [FAIL] {rel}: {r['error']}")
 
     # Final summary
     print()
@@ -368,10 +617,11 @@ def cmd_convert(args):
     print(f"=================================================================")
     print(f"  Files processed : {len(candidates)}")
     print(f"  Succeeded       : {succeeded}")
+    print(f"  Skipped         : {skipped}")
     print(f"  Failed          : {failed}")
-    if args.verify:
-        print(f"  Lossless        : {lossless_cnt}")
-        print(f"  Lossy           : {lossy_cnt}")
+    print(f"  Lossless        : {lossless_cnt}")
+    print(f"  Lossy           : {lossy_cnt}")
+    print(f"  Unchecked       : {unchecked_cnt}  (no --verify, or heuristic only)")
     print(f"  Total input     : {total_in:,} bytes")
     print(f"  Total output    : {total_out:,} bytes")
     if total_in > 0:
@@ -384,6 +634,26 @@ def cmd_convert(args):
         print(f"  Failures:")
         for rel, err in per_file_failures:
             print(f"    - {rel}: {err}")
+
+    if args.report:
+        summary = {
+            "files_processed": len(candidates),
+            "succeeded": succeeded,
+            "failed": failed,
+            "skipped": skipped,
+            "lossless_cnt": lossless_cnt,
+            "lossy_cnt": lossy_cnt,
+            "unchecked_cnt": unchecked_cnt,
+            "total_in": total_in,
+            "total_out": total_out,
+            "overall_ratio": (total_out / total_in) if total_in > 0 else None,
+        }
+        try:
+            _write_report(args.report, summary, per_file_results)
+            print()
+            print(f"  Report written: {args.report}")
+        except Exception as e:
+            print(f"  Failed to write report: {e}")
 
     return 0 if failed == 0 else 2
 
@@ -562,13 +832,29 @@ Examples:
     p_inspect.add_argument('--ignore-crc', action='store_true', help='Skip PNG CRC checks')
     p_inspect.add_argument('--decode-and-check', '-d', action='store_true', help='Also run full decode')
 
-    p_conv = sub.add_parser('convert', help='Convert between BMP and PNG')
+    p_conv = sub.add_parser('convert', help='Convert between BMP and PNG (file or directory batch)')
     p_conv.add_argument('input', help='Input file or directory')
     p_conv.add_argument('output', help='Output file or directory')
     p_conv.add_argument('--from', dest='from_fmt', choices=['bmp', 'png'])
     p_conv.add_argument('--to', dest='to_fmt', choices=['bmp', 'png'])
     p_conv.add_argument('--verify', action='store_true', help='Re-decode output and report lossiness')
     p_conv.add_argument('--quiet', action='store_true', help='Batch mode: only print per-file failures + summary')
+
+    # Batch controls
+    p_conv.add_argument('--no-recursive', dest='recursive', action='store_false',
+                        help='Do not descend into subdirectories (default: recursive)')
+    p_conv.add_argument('--keep-structure', dest='keep_structure', action='store_true', default=True,
+                        help='Preserve relative directory structure in output (default: on)')
+    p_conv.add_argument('--flatten', dest='keep_structure', action='store_false',
+                        help='Dump all output files into a single output directory')
+    p_conv.add_argument('--overwrite', choices=['ask', 'always', 'never', 'rename'], default='always',
+                        help='How to handle existing output files (default: always)')
+    p_conv.add_argument('--include-ext', dest='include_ext',
+                        help='Comma-separated list of input extensions to process (default: .bmp,.png,.dib)')
+
+    # Reports
+    p_conv.add_argument('--report', help='Write a batch report to this path (.json or .csv inferred from extension)')
+
     p_conv.add_argument('--bmp-bpp', type=int, choices=[1, 2, 4, 8, 16, 24, 32], help='BMP bits per pixel')
     p_conv.add_argument('--png-color', help='PNG color type: rgb|rgba|indexed|gray or number')
     p_conv.add_argument('--png-depth', type=int, choices=[1, 2, 4, 8], help='PNG bit depth')

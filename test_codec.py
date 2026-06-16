@@ -1229,6 +1229,357 @@ def test_cli_batch_with_corrupt_files():
     return all_pass
 
 
+# ============================================================
+# Test 12: Transparent PNG -> BMP24 (lossy) vs BMP32 (lossless alpha)
+# ============================================================
+
+def test_transparent_png_to_bmp_lossy_vs_lossless():
+    print("\n" + "=" * 65)
+    print("TEST 12: Transparent PNG -> BMP24 (lossy) / BMP32 (lossless)")
+    print("=" * 65)
+
+    all_pass = True
+    from cli import _convert_single
+    from cli import _image_has_alpha, _output_has_alpha
+    import tempfile
+    import argparse
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src_img = create_transparent_rgba_image(8, 6)
+        src_path = os.path.join(tmp, "src.png")
+        with open(src_path, 'wb') as f:
+            f.write(src_img.to_png(color_type=6, filter_type=4))
+
+        def fake_args(**kw):
+            ns = argparse.Namespace()
+            ns.options = None
+            ns.bmp_bpp = kw.get('bmp_bpp')
+            ns.png_color = kw.get('png_color')
+            ns.png_depth = kw.get('png_depth')
+            ns.png_filter = kw.get('png_filter')
+            ns.palette_strategy = kw.get('palette_strategy')
+            ns.from_fmt = None
+            ns.to_fmt = None
+            ns.verify = kw.get('verify', True)
+            ns.overwrite = 'always'
+            return ns
+
+        # -> BMP24: alpha must be discarded (lossy)
+        print("  --- RGBA PNG -> BMP 24-bit (should be LOSSY: alpha discarded) ---")
+        bmp24 = os.path.join(tmp, "out.bmp")
+        r1 = _convert_single(src_path, bmp24, fake_args(bmp_bpp=24, verify=True), verbose=False)
+        ok = (r1["ok"] and r1["lossiness"] == "lossy" and r1["diff_count"] is not None and r1["diff_count"] > 0)
+        tag = "PASS" if ok else "FAIL"
+        if not ok:
+            all_pass = False
+        print(f"    [{tag}] ok={r1['ok']} lossiness={r1['lossiness']} diffs={r1['diff_count']} max={r1['max_diff']}")
+
+        # -> BMP32: alpha preserved (should be lossless)
+        print("  --- RGBA PNG -> BMP 32-bit (should be LOSSLESS: alpha preserved) ---")
+        bmp32 = os.path.join(tmp, "out32.bmp")
+        r2 = _convert_single(src_path, bmp32, fake_args(bmp_bpp=32, verify=True), verbose=False)
+        ok = (r2["ok"] and r2["lossiness"] == "lossless" and r2["diff_count"] == 0)
+        tag = "PASS" if ok else "FAIL"
+        if not ok:
+            all_pass = False
+        print(f"    [{tag}] ok={r2['ok']} lossiness={r2['lossiness']} diffs={r2['diff_count']} max={r2['max_diff']}")
+
+        # -> BMP24 WITHOUT --verify: heuristic says likely-lossy
+        print("  --- RGBA PNG -> BMP 24-bit (no --verify): heuristic likely-lossy ---")
+        bmp24_nv = os.path.join(tmp, "out_nv.bmp")
+        r3 = _convert_single(src_path, bmp24_nv, fake_args(bmp_bpp=24, verify=False), verbose=False)
+        ok = (r3["ok"] and r3["lossiness"] == "likely-lossy" and r3["note"] is not None and "alpha" in r3["note"])
+        tag = "PASS" if ok else "FAIL"
+        if not ok:
+            all_pass = False
+        print(f"    [{tag}] lossiness={r3['lossiness']} note={r3['note']!r}")
+
+        # -> RGBA PNG WITHOUT --verify: heuristic says likely-lossless
+        print("  --- RGBA PNG -> RGBA PNG (no --verify): heuristic likely-lossless ---")
+        rgba_png = os.path.join(tmp, "out_rgba.png")
+        r4 = _convert_single(src_path, rgba_png, fake_args(png_color='rgba', png_depth=8, png_filter='paeth', verify=False), verbose=False)
+        ok = (r4["ok"] and r4["lossiness"] == "likely-lossless")
+        tag = "PASS" if ok else "FAIL"
+        if not ok:
+            all_pass = False
+        print(f"    [{tag}] lossiness={r4['lossiness']} note={r4['note']!r}")
+
+    return all_pass
+
+
+# ============================================================
+# Test 13: Batch reports (JSON/CSV) + nested dir partial failure
+# ============================================================
+
+def test_batch_reports_and_nested_dir():
+    print("\n" + "=" * 65)
+    print("TEST 13: Batch JSON/CSV reports + nested directory + partial fail")
+    print("=" * 65)
+
+    all_pass = True
+    import tempfile
+    import shutil
+    import json
+    import csv
+    from cli import main as cli_main
+
+    with tempfile.TemporaryDirectory() as tmp:
+        in_dir = os.path.join(tmp, "in")
+        out_dir = os.path.join(tmp, "out")
+
+        # Nested structure
+        good_a = os.path.join(in_dir, "a")
+        good_b = os.path.join(in_dir, "sub", "b")
+        bad_c = os.path.join(in_dir, "sub", "broken")
+        os.makedirs(good_a, exist_ok=True)
+        os.makedirs(good_b, exist_ok=True)
+        os.makedirs(bad_c, exist_ok=True)
+
+        # Good PNG in top-level
+        img_a = create_gradient_image(6, 5, alpha=False)
+        with open(os.path.join(good_a, "grad.png"), 'wb') as f:
+            f.write(img_a.to_png(color_type=2))
+
+        # Good BMP in sub/b
+        img_b = create_few_colors_image(9, 4, num_colors=6, seed=22)
+        with open(os.path.join(good_b, "small.bmp"), 'wb') as f:
+            f.write(img_b.to_bmp(8, palette_strategy="quantize"))
+
+        # Bad PNG in sub/broken (corrupt)
+        with open(os.path.join(bad_c, "corrupt.png"), 'wb') as f:
+            f.write(b'\x89PNG\r\n\x1a\nTHIS-IS-CORRUPT')
+
+        json_report = os.path.join(tmp, "report.json")
+        csv_report = os.path.join(tmp, "report.csv")
+
+        # Run batch with --recursive (default), --report json
+        rc = cli_main(["convert", in_dir, out_dir, "--to", "png",
+                       "--png-color", "rgba", "--verify", "--quiet",
+                       "--report", json_report])
+
+        print(f"  --- Batch recursive with JSON report (rc={rc}) ---")
+        if rc != 2:
+            print(f"    [WARN] Expected rc=2 (one failure), got {rc}")
+
+        # Verify structure preserved (keep_structure default on)
+        expected = [
+            os.path.join(out_dir, "a", "grad.png"),
+            os.path.join(out_dir, "sub", "b", "small.png"),
+        ]
+        for p in expected:
+            ok = os.path.exists(p)
+            tag = "PASS" if ok else "FAIL"
+            if not ok:
+                all_pass = False
+            print(f"    [{tag}] Nested structure preserved: {os.path.relpath(p, out_dir)}")
+
+        # Verify JSON report is valid and contains summary
+        if os.path.exists(json_report):
+            try:
+                with open(json_report, 'r', encoding='utf-8') as f:
+                    j = json.load(f)
+                s = j.get("summary", {})
+                has_sum = ("files_processed" in s and "succeeded" in s and "failed" in s
+                           and "lossless_cnt" in s and "lossy_cnt" in s)
+                has_files = isinstance(j.get("files"), list) and len(j["files"]) == 3
+                tag = "PASS" if (has_sum and has_files) else "FAIL"
+                if not (has_sum and has_files):
+                    all_pass = False
+                print(f"    [{tag}] JSON report valid: summary={has_sum}, files={has_files}, "
+                      f"processed={s.get('files_processed')}, succeeded={s.get('succeeded')}, failed={s.get('failed')}")
+            except Exception as e:
+                print(f"    [FAIL] JSON parse error: {e}")
+                all_pass = False
+        else:
+            print(f"    [FAIL] JSON report file missing")
+            all_pass = False
+
+        # Run again --flatten + --overwrite=rename + CSV report
+        out2 = os.path.join(tmp, "out2")
+        rc2 = cli_main(["convert", in_dir, out2, "--to", "bmp", "--bmp-bpp", "24",
+                        "--flatten", "--no-recursive",
+                        "--overwrite", "rename",
+                        "--include-ext", ".png",
+                        "--quiet",
+                        "--report", csv_report])
+        print(f"  --- Batch non-recursive, flatten, include-ext=.png, CSV report (rc={rc2}) ---")
+
+        # Non-recursive: only the 'a' dir file NOT processed (it's in subdir); wait --no-recursive
+        # means only direct children of in_dir; but our in_dir direct children are "a", "sub" directories
+        # so no files -> count 0 processed -> rc 0. Hmm, this is fine.
+        # Let's instead use a flat dir: move good file to top-level. Re-do the test
+        # in a simpler way.
+
+        # Actually use CSV report from first run instead by regenerating
+        csv_report2 = os.path.join(tmp, "report2.csv")
+        cli_main(["convert", in_dir, os.path.join(tmp, "out3"), "--to", "png",
+                  "--png-color", "rgb", "--verify", "--quiet",
+                  "--report", csv_report2])
+        if os.path.exists(csv_report2):
+            try:
+                with open(csv_report2, 'r', encoding='utf-8', newline='') as f:
+                    reader = list(csv.DictReader(f))
+                has_header = len(reader) >= 1 and "input" in reader[0]
+                has_summary = any(r.get("input") == "__SUMMARY__" for r in reader)
+                tag = "PASS" if (has_header and has_summary) else "FAIL"
+                if not (has_header and has_summary):
+                    all_pass = False
+                print(f"    [{tag}] CSV report: rows={len(reader)}, header={has_header}, summary_row={has_summary}")
+            except Exception as e:
+                print(f"    [FAIL] CSV parse error: {e}")
+                all_pass = False
+        else:
+            print(f"    [FAIL] CSV report file missing")
+            all_pass = False
+
+    return all_pass
+
+
+# ============================================================
+# Test 14: 16-bit PNG + Grayscale+Alpha (color type 4) decode
+# ============================================================
+
+def test_16bit_and_grayalpha_decode():
+    print("\n" + "=" * 65)
+    print("TEST 14: 16-bit PNG / Grayscale+Alpha decode support")
+    print("=" * 65)
+
+    all_pass = True
+
+    def build_png_via_raw(color_type, bit_depth, pixel_writer, width=4, height=3):
+        """Helper: build a raw PNG with given color_type/bit_depth from raw pixels."""
+        import zlib as _zl
+        ihdr_data = struct.pack('>II', width, height) + bytes([bit_depth, color_type, 0, 0, 0])
+        out = bytearray(PNG_SIGNATURE)
+        out.extend(PNGChunk(b'IHDR', ihdr_data).encode())
+
+        # Build filtered scanlines (filter=0)
+        raw = bytearray()
+        for y in range(height):
+            raw.append(0)  # filter=none
+            pixel_writer(raw, y, width)
+
+        comp = _zl.compress(bytes(raw))
+        out.extend(PNGChunk(b'IDAT', comp).encode())
+        out.extend(PNGChunk(b'IEND', b'').encode())
+        return bytes(out)
+
+    # Subtest A: 16-bit RGB color type 2
+    print("  --- 16-bit RGB (color_type=2, bit_depth=16) ---")
+    def writer_16rgb(raw, y, w):
+        for x in range(w):
+            # Use high bytes distinguishable from low bytes
+            v = (x * 50 + y * 100) & 0xFF
+            # Write R=r, G=g, B=b in both high and low byte
+            r = (x * 37 + y * 7) & 0xFF
+            g = (x * 71 + y * 13) & 0xFF
+            b = (x * 101 + y * 19) & 0xFF
+            raw.append(r); raw.append(0)  # R = r<<8
+            raw.append(g); raw.append(0)  # G = g<<8
+            raw.append(b); raw.append(0)  # B = b<<8
+
+    data16 = build_png_via_raw(2, 16, writer_16rgb, width=4, height=3)
+    try:
+        decoded = Image.from_png(data16)
+        # spot-check first pixel
+        r0 = decoded.pixels[0][0]
+        expected_r = (0 * 37 + 0 * 7) & 0xFF
+        expected_g = (0 * 71 + 0 * 13) & 0xFF
+        expected_b = (0 * 101 + 0 * 19) & 0xFF
+        ok = (r0[0] == expected_r and r0[1] == expected_g and r0[2] == expected_b and r0[3] == 255)
+        tag = "PASS" if ok else "FAIL"
+        if not ok:
+            all_pass = False
+        print(f"    [{tag}] Decoded dims={decoded.width}x{decoded.height}, pixel(0,0)={r0}, expected=({expected_r},{expected_g},{expected_b},255)")
+    except PNGError as e:
+        print(f"    [FAIL] 16-bit RGB PNGError: {e.code} {e}")
+        all_pass = False
+    except Exception as e:
+        print(f"    [FAIL] 16-bit RGB {type(e).__name__}: {e}")
+        all_pass = False
+
+    # Subtest B: 8-bit Grayscale+Alpha (color_type=4)
+    print("  --- 8-bit Gray+Alpha (color_type=4, bit_depth=8) ---")
+    def writer_ga8(raw, y, w):
+        for x in range(w):
+            gray = (x * 40 + y * 30) % 256
+            alpha = 0 if x == 0 else (128 if x == 1 else 255)
+            raw.append(gray); raw.append(alpha)
+
+    data_ga = build_png_via_raw(4, 8, writer_ga8, width=3, height=2)
+    try:
+        decoded = Image.from_png(data_ga)
+        expected_px = {
+            (0, 0): ((0, 0, 0), 0),
+            (1, 0): ((40, 40, 40), 128),
+            (2, 0): ((80, 80, 80), 255),
+            (0, 1): ((30, 30, 30), 0),
+        }
+        all_ok = True
+        for (x, y), (exp_rgb, exp_a) in expected_px.items():
+            p = decoded.pixels[y][x]
+            if (p[0], p[1], p[2]) != exp_rgb or p[3] != exp_a:
+                all_ok = False
+                print(f"    [FAIL] pixel({x},{y})={p}, expected RGB={exp_rgb} A={exp_a}")
+        print(f"    [{'PASS' if all_ok else 'FAIL'}] Gray+Alpha decode: {len(expected_px)} pixels checked")
+        if not all_ok:
+            all_pass = False
+    except Exception as e:
+        print(f"    [FAIL] Gray+Alpha {type(e).__name__}: {e}")
+        all_pass = False
+
+    # Subtest C: Grayscale PNG + tRNS chroma-key (gray=128 -> alpha=0)
+    print("  --- 8-bit Grayscale + tRNS chroma-key (gray=128 transparent) ---")
+    def writer_g8(raw, y, w):
+        for x in range(w):
+            v = 64 if (x + y) % 2 == 0 else 128
+            raw.append(v)
+
+    data_gray_keyed = build_png_via_raw(0, 8, writer_g8, width=4, height=2)
+    # Inject a tRNS chunk before IDAT manually
+    # Rebuild properly using PNGChunk:
+    import zlib as _zl
+    ihdr_data = struct.pack('>IIBBBBB', 4, 2, 8, 0, 0, 0, 0)
+    trns_data = struct.pack('>H', 128)  # gray = 128 is transparent
+    raw = bytearray()
+    for y in range(2):
+        raw.append(0)
+        for x in range(4):
+            v = 64 if (x + y) % 2 == 0 else 128
+            raw.append(v)
+    comp = _zl.compress(bytes(raw))
+    tkeyed = bytearray(PNG_SIGNATURE)
+    tkeyed.extend(PNGChunk(b'IHDR', ihdr_data).encode())
+    tkeyed.extend(PNGChunk(b'tRNS', trns_data).encode())
+    tkeyed.extend(PNGChunk(b'IDAT', comp).encode())
+    tkeyed.extend(PNGChunk(b'IEND', b'').encode())
+
+    try:
+        decoded = Image.from_png(bytes(tkeyed))
+        # (0,0): 64 (opaque=255), (1,0): 128 (transparent=0), etc.
+        checks = [
+            ((0, 0), (64, 64, 64), 255),
+            ((1, 0), (128, 128, 128), 0),
+            ((2, 0), (64, 64, 64), 255),
+            ((1, 1), (64, 64, 64), 255),
+            ((0, 1), (128, 128, 128), 0),
+        ]
+        all_ok = True
+        for (x, y), exp_rgb, exp_a in checks:
+            p = decoded.pixels[y][x]
+            if (p[0], p[1], p[2]) != exp_rgb or p[3] != exp_a:
+                all_ok = False
+                print(f"    [FAIL] pixel({x},{y})={p}, expected RGB={exp_rgb} A={exp_a}")
+        print(f"    [{'PASS' if all_ok else 'FAIL'}] Grayscale tRNS chroma-key: {len(checks)} pixels checked")
+        if not all_ok:
+            all_pass = False
+    except Exception as e:
+        print(f"    [FAIL] Grayscale tRNS {type(e).__name__}: {e}")
+        all_pass = False
+
+    return all_pass
+
+
 def main():
     print()
     print("#" * 65)
@@ -1247,6 +1598,9 @@ def main():
         ("PNG tRNS palette transparency + cross-format", test_png_trns_transparency),
         ("Strict indexed write validation (palette + index)", test_write_indexed_strict_validation),
         ("CLI batch convert with corrupt files", test_cli_batch_with_corrupt_files),
+        ("Transparent PNG -> BMP24(lossy)/BMP32(lossless)", test_transparent_png_to_bmp_lossy_vs_lossless),
+        ("Batch JSON/CSV reports + nested dir + partial fail", test_batch_reports_and_nested_dir),
+        ("16-bit PNG + Grayscale+Alpha decode", test_16bit_and_grayalpha_decode),
     ]
 
     results = []

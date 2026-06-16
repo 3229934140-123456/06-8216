@@ -44,9 +44,21 @@ class PNGError(Exception):
             lines.append("  - This often happens with partial file downloads")
         elif self.code == "COLOR_MODE":
             lines.append("  - Unsupported combination of color type and bit depth")
-            lines.append("  - Supported: 8-bit for all modes, plus 1/4-bit for Indexed")
+            lines.append("  - Decoder supports: 8-bit RGB(2), 8-bit RGBA(6), 1/2/4/8-bit Indexed(3), 8-bit Grayscale(0), 8-bit Gray+Alpha(4)")
+            lines.append("  - 16-bit samples are downscaled to 8-bit when reading (no write support)")
+            lines.append("  - Adam7 interlacing is not supported")
         elif self.code == "INDEXED_NO_PALETTE":
             lines.append("  - Indexed color (type 3) requires a PLTE chunk before IDAT")
+        elif self.code == "FEATURE":
+            lines.append("  - PNG uses a feature this decoder does not implement")
+            lines.append("  - Most common: Adam7 interlacing (requires deinterlace pass)")
+            lines.append("  - Re-encode without interlacing, or use another tool")
+        elif self.code == "INDEXED_OOB":
+            lines.append("  - A pixel referenced a palette index beyond PLTE size")
+            lines.append("  - This is a file error, not a decoder limitation")
+        elif self.code == "ORDER":
+            lines.append(f"  - Chunk {self.details.get('chunk', '')} appeared in an invalid position")
+            lines.append("  - Order rules: IHDR first, PLTE/tRNS before IDAT, IEND last")
         return "\n".join(lines)
 
 
@@ -561,6 +573,8 @@ def _decode_pixels(raw_rows, img):
     color_type = img.color_type
 
     pixels = []
+    # For 16-bit samples we downscale to 8-bit (>>8)
+    downscale = (bit_depth == 16)
 
     for y in range(height):
         row = raw_rows[y]
@@ -574,6 +588,13 @@ def _decode_pixels(raw_rows, img):
                 b = row[pos + 2]
                 pixel_row.append((r, g, b))
                 pos += 3
+        elif color_type == 2 and bit_depth == 16:
+            for x in range(width):
+                r = row[pos]  # take high byte
+                g = row[pos + 2]
+                b = row[pos + 4]
+                pixel_row.append((r, g, b))
+                pos += 6
         elif color_type == 6 and bit_depth == 8:
             for x in range(width):
                 r = row[pos]
@@ -581,6 +602,27 @@ def _decode_pixels(raw_rows, img):
                 b = row[pos + 2]
                 a = row[pos + 3]
                 pixel_row.append((r, g, b, a))
+                pos += 4
+        elif color_type == 6 and bit_depth == 16:
+            for x in range(width):
+                r = row[pos]
+                g = row[pos + 2]
+                b = row[pos + 4]
+                a = row[pos + 6]
+                pixel_row.append((r, g, b, a))
+                pos += 8
+        elif color_type == 4 and bit_depth == 8:
+            # Grayscale + Alpha (8-bit)
+            for x in range(width):
+                gray = row[pos]
+                alpha = row[pos + 1]
+                pixel_row.append((gray, gray, gray, alpha))
+                pos += 2
+        elif color_type == 4 and bit_depth == 16:
+            for x in range(width):
+                gray = row[pos]
+                alpha = row[pos + 2]
+                pixel_row.append((gray, gray, gray, alpha))
                 pos += 4
         elif color_type == 3:
             if bit_depth == 8:
@@ -627,10 +669,29 @@ def _decode_pixels(raw_rows, img):
             for x in range(width):
                 gray = row[x]
                 pixel_row.append(gray)
+        elif color_type == 0 and bit_depth == 16:
+            for x in range(width):
+                gray = row[pos]  # high byte
+                pixel_row.append(gray)
+                pos += 2
+        elif color_type == 0 and bit_depth in (1, 2, 4):
+            # Packed grayscale
+            samples_per_byte = 8 // bit_depth
+            mask = (1 << bit_depth) - 1
+            for x in range(width):
+                byte_idx = x // samples_per_byte
+                sample_offset = x % samples_per_byte
+                shift = 8 - bit_depth - sample_offset * bit_depth
+                gray = ((row[byte_idx] >> shift) & mask) * (255 // mask) if mask > 0 else 0
+                pixel_row.append(gray)
         else:
             raise PNGError("COLOR_MODE",
-                           f"Unsupported decoder combination: color_type={color_type}, bit_depth={bit_depth}",
-                           details={"implemented_modes": ["8-bit RGB(2)", "8-bit RGBA(6)", "1/2/4/8-bit Indexed(3)", "8-bit Grayscale(0)"]})
+                           f"Unsupported decoder combination: color_type={color_type} ({COLOR_TYPE_NAMES.get(color_type, '?')}), bit_depth={bit_depth}",
+                           details={"implemented_modes": [
+                               "8/16-bit RGB(2)", "8/16-bit RGBA(6)",
+                               "8/16-bit Gray+Alpha(4)", "8/16-bit Grayscale(0)",
+                               "1/2/4/8-bit Indexed(3)"
+                           ]})
 
         pixels.append(pixel_row)
 
